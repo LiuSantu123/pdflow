@@ -49,7 +49,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     searched = ", ".join(str(item) for item in config_candidates(path))
     raise ConfigError(
         f"no pdflow config found (searched: {searched}). "
-        "Run `pdflow init` and edit backends.yaml."
+        "Run `pdflow setup` and edit backends.yaml."
     )
 
 
