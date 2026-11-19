@@ -1,0 +1,15 @@
+# Environments and generated artefacts
+backends.yaml
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Campaigns and run outputs
+runs/
+pdflow-runs/
+hydra_outputs/
+.conda/
