@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -385,63 +387,112 @@ def run_esmfold(job: Job, outdir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     return {"returncode": result.returncode, "command": command}
 
 
-def run_esmfold2_overlay(
-    job: Job, outdir: Path, cfg: dict[str, Any]
-) -> dict[str, Any]:
-    """Reserved adapter for the ESMFold2 + ESMC-6B RTX-50 overlay.
+def esmfold2_overlay_env(predictor: dict[str, Any]) -> dict[str, str]:
+    env = _common_env(predictor, pythonpath=predictor.get("pythonpath"))
+    if predictor.get("python"):
+        env["ESMFOLD2_PYTHON"] = str(predictor["python"])
+    return env
 
-    The overlay consumes a directory of JSON inputs and writes
-    ``structures/*.cif`` + ``confidences/*.npz``. It is disabled by default
-    until ESMFOLD2_WEIGHTS and ESMFOLD2_ESMC are configured.
-    """
-    predictor = get(cfg, "predictors.esmfold2_overlay", {}) or {}
-    if not predictor.get("enabled", False):
-        return {"returncode": 0, "skipped": "esmfold2_overlay is disabled"}
-    proteins = job.proteins
-    if len(job.chains) != 1 or len(proteins) != 1:
-        return {
-            "returncode": 0,
-            "skipped": "ESMFold2 overlay supports one protein chain per job",
-        }
-    repo = Path(str(predictor.get("repo", ""))).expanduser()
-    script = repo / "scripts" / "esmfold2_50.sh"
-    if not script.is_file():
-        return {
-            "returncode": -1,
-            "error": f"ESMFold2 overlay script not found: {script}",
-        }
 
-    input_dir = outdir / "input"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    chain = proteins[0]
-    record: dict[str, Any] = {"sequence": chain.sequence, "chains": ["A"]}
+def _write_esmfold2_input(job: Job, directory: Path) -> None:
+    chain = job.chains[0]
+    if job.name in {"", ".", ".."} or Path(job.name).name != job.name:
+        raise ValueError("ESMFold2 job name must be a file stem")
+    if not re.fullmatch(r"[A-Z]+", chain.id):
+        raise ValueError("ESMFold2 requires an uppercase alphabetic chain ID")
+    if not re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWYX]+", chain.sequence):
+        raise ValueError("ESMFold2 requires an ungapped amino acid sequence")
+    record: dict[str, Any] = {"sequence": chain.sequence, "chains": [chain.id]}
     if chain.msa:
-        msa_dst = input_dir / "query.a3m"
-        shutil.copyfile(chain.msa, msa_dst)
-        record["msa"] = "query.a3m"
-    (input_dir / f"{job.name}.json").write_text(
+        records = read_fasta(Path(chain.msa))
+        if not records or records[0][1] != chain.sequence:
+            raise ValueError("ESMFold2 A3M query must match the input sequence")
+        if len(records) > 1:
+            msa_name = f"{job.name}.a3m"
+            shutil.copyfile(chain.msa, directory / msa_name)
+            record["msa"] = msa_name
+    (directory / f"{job.name}.json").write_text(
         json.dumps({"proteins": [record]}), encoding="utf-8"
     )
 
-    command = [
-        "bash",
-        str(script),
-        str(input_dir),
-        str(outdir / "output"),
-        "--mode",
-        str(predictor.get("mode", "blackwell")),
+
+def _run_esmfold2_batch(
+    jobs: list[Job], outdir: Path, predictor: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    eligible: list[Job] = []
+    for job in jobs:
+        if not predictor.get("enabled", False):
+            results[job.name] = {"returncode": 0, "skipped": "esmfold2_overlay is disabled"}
+        elif len(job.chains) != 1 or job.chains[0].kind != "protein":
+            results[job.name] = {
+                "returncode": 0,
+                "skipped": "ESMFold2 overlay supports one protein chain per job",
+            }
+        else:
+            eligible.append(job)
+    if not eligible:
+        return results
+
+    repo = Path(str(predictor.get("repo", ""))).expanduser()
+    script = (repo / "scripts" / "esmfold2_50.sh").resolve()
+    env = esmfold2_overlay_env(predictor)
+    missing = [
+        key for key in ("ESMFOLD2_WEIGHTS", "ESMFOLD2_ESMC")
+        if not env.get(key) or not Path(env[key]).is_dir()
     ]
-    command += [str(item) for item in predictor.get("extra_args", [])]
-    env_extra = dict(get(predictor, "env", {}) or {})
-    if predictor.get("python"):
-        env_extra["ESMFOLD2_PYTHON"] = str(predictor["python"])
-    env = tool_env(
-        {},
-        extra=env_extra,
-        clean_ld=bool(predictor.get("clean_ld_library_path", False)),
-    )
-    result = run_command(command, env=env, log_path=outdir / "run.log")
-    return {"returncode": result.returncode, "command": command}
+    if not script.is_file() or missing:
+        error = (f"ESMFold2 overlay script not found: {script}" if not script.is_file()
+                 else "Configure local checkpoint directories: " + ", ".join(missing))
+        results.update({job.name: {"returncode": -1, "error": error} for job in eligible})
+        return results
+
+    outdir = outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    batch_dir = Path(tempfile.mkdtemp(prefix="batch-", dir=outdir))
+    output = batch_dir / "output"
+    log = batch_dir / "run.log"
+    with tempfile.TemporaryDirectory(prefix="inputs-", dir=batch_dir) as temporary:
+        input_dir = Path(temporary)
+        submitted: list[Job] = []
+        for job in eligible:
+            try:
+                _write_esmfold2_input(job, input_dir)
+            except (OSError, ValueError) as exc:
+                results[job.name] = {"returncode": -1, "error": str(exc)}
+            else:
+                submitted.append(job)
+        if not submitted:
+            return results
+        command = [
+            "bash", str(script), str(input_dir), str(output),
+            "--mode", str(predictor.get("mode", "blackwell")),
+            *map(str, predictor.get("extra_args", [])),
+        ]
+        completed = run_command(command, env=env, log_path=log)
+
+    summary_path = output / "summary.json"
+    rows: dict[str, dict] = {}
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        rows = {row["design"]: row for row in summary.get("results", [])}
+    for job in submitted:
+        row = rows.get(job.name, {})
+        structure = output / "structures" / f"{job.name}_model.cif"
+        confidence = output / "confidences" / f"{job.name}_confidences.npz"
+        payload: dict[str, Any] = {"output": str(output), "log": str(log)}
+        if row.get("status") == "ok" and structure.is_file() and confidence.is_file():
+            payload["returncode"] = 0
+        else:
+            payload["returncode"] = completed.returncode or -1
+            payload["error"] = row.get("error") or f"Missing completed ESMFold2 output; see {log}"
+        results[job.name] = payload
+    return results
+
+
+def run_esmfold2_overlay(job: Job, outdir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    predictor = get(cfg, "predictors.esmfold2_overlay", {}) or {}
+    return _run_esmfold2_batch([job], outdir, predictor)[job.name]
 
 
 RUNNERS = {
@@ -465,10 +516,27 @@ def run_jobs(
     unknown = [name for name in predictors if name not in RUNNERS]
     if unknown:
         raise ValueError(f"unknown predictors: {unknown}")
+    overlay_results: dict[str, dict[str, Any]] = {}
+    if "esmfold2_overlay" in predictors:
+        try:
+            overlay_results = _run_esmfold2_batch(
+                jobs, outroot / "_batches" / "esmfold2_overlay",
+                get(cfg, "predictors.esmfold2_overlay", {}) or {},
+            )
+        except (OSError, ValueError, KeyError) as exc:
+            overlay_results = {
+                job.name: {"returncode": -1, "error": str(exc)} for job in jobs
+            }
     for job in jobs:
         for predictor_name in predictors:
             outdir = outroot / job.name / predictor_name
             outdir.mkdir(parents=True, exist_ok=True)
+            if predictor_name == "esmfold2_overlay":
+                payload = overlay_results[job.name]
+                payload.update(job=job.name, predictor=predictor_name, outdir=str(outdir))
+                (outdir / "status.json").write_text(json.dumps(payload, indent=2))
+                results.append(payload)
+                continue
             try:
                 payload = RUNNERS[predictor_name](job, outdir, cfg)
             except Exception as exc:  # keep the campaign running

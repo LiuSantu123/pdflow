@@ -159,6 +159,7 @@ predictors:
     env:
       MOL_ROOT_DIR: __HOME__/mol1-data
 
+  # Legacy ID: runs ESMFold v1.
   esmfold2:
     python: __CONDA_BASE__/envs/esmfold/bin/python
     script: __MODEL_ROOT__/esmfold/run_esmfold.py
@@ -170,8 +171,7 @@ predictors:
     # ESMFold has no MSA and no ligands; pdflow skips it for complexes.
     single_chain_only: true
 
-  # Reserved interface for the RTX-50 ESMFold2 + ESMC-6B overlay. Disabled by
-  # default; set enabled: true and point python/weights at your installation.
+  # ESMFold2 + ESMC-6B. Enable and set repo, python and both local checkpoints.
   esmfold2_overlay:
     enabled: false
     repo: "__KIT_ROOT__"

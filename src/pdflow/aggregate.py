@@ -49,6 +49,7 @@ def score_campaign(root: Path, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     manifest = {record["backbone_id"]: record for record in campaign.read_manifest(root)}
 
     summary: list[dict[str, Any]] = []
+    overlay_summaries: dict[Path, dict[str, dict[str, Any]]] = {}
     for sequence_path in sorted(layout["sequences"].glob("*.fasta")):
         if sequence_path.name == "all.fasta":
             continue
@@ -66,12 +67,30 @@ def score_campaign(root: Path, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             search_root = predictor_dir / "output"
             if not search_root.is_dir():
                 search_root = predictor_dir
-            artifacts = metrics.discover_models(predictor_name, search_root)
+            status_path = predictor_dir / "status.json"
+            status = (
+                json.loads(status_path.read_text(encoding="utf-8"))
+                if status_path.is_file() else {}
+            )
+            if predictor_name == "esmfold2_overlay":
+                artifacts = []
+                if not status.get("skipped") and status.get("returncode", 0) == 0:
+                    if status.get("output"):
+                        search_root = Path(status["output"])
+                    if search_root not in overlay_summaries:
+                        path = search_root / "summary.json"
+                        document = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+                        overlay_summaries[search_root] = {
+                            row["design"]: row for row in document.get("results", [])
+                        }
+                    artifacts = metrics.discover_models(
+                        predictor_name, search_root, design=seq_id,
+                        batch_summary=overlay_summaries[search_root],
+                    )
+            else:
+                artifacts = metrics.discover_models(predictor_name, search_root)
             if not artifacts:
-                status: dict[str, Any] = {}
-                status_path = predictor_dir / "status.json"
-                if status_path.is_file():
-                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                predictor_dir.mkdir(parents=True, exist_ok=True)
                 payload = {
                     "sequence_id": seq_id,
                     "backbone_id": backbone_name,
@@ -280,7 +299,15 @@ def finalize(root: Path, cfg: dict[str, Any], clean: bool = True) -> dict[str, A
         "csv": str(layout["csv"]),
     }
     if clean:
-        shutil.rmtree(layout["predictions"], ignore_errors=True)
+        batch_root = layout["predictions"] / "_batches"
+        if batch_root.is_dir():
+            # Shared predictor runs contain the retained structures, raw
+            # confidence arrays and run summaries, not just intermediates.
+            for path in layout["predictions"].iterdir():
+                if path != batch_root and path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+        else:
+            shutil.rmtree(layout["predictions"], ignore_errors=True)
         shutil.rmtree(layout["design_runs"], ignore_errors=True)
         # RFD4/Hydra writes its run directory next to the campaign.
         shutil.rmtree(layout["root"] / "hydra_outputs", ignore_errors=True)

@@ -175,16 +175,43 @@ query_msa_fallback: true          # kit gate requires an explicit MSA
 
 ### ESMFold2 overlay
 
-The current `esmfold2` backend is ESMFold v1 and has no acceleration kit. The
-new overlay in `kits/esmfold2` targets ESMFold2 + ESMC-6B on RTX 50-series and
-uses modes `blackwell` (default), `tiled` (low-memory reference) and `stock`.
-It needs `esm==3.4.0`, `ESMFOLD2_WEIGHTS` and `ESMFOLD2_ESMC`; those checkpoints
-are not in the repository and are not installed on the reference host. Provide
-the two weight paths before wiring it into `predictors`.
+`esmfold2_overlay` runs ESMFold2 + ESMC-6B through the RTX 50 series launcher
+in the [Blackwell acceleration kit](https://github.com/LiuSantu123/claude-blackwell-protein-accel-kit/tree/v0.2.0-sm120).
+Point `repo` at the checkout that contains
+`scripts/esmfold2_50.sh`, `python` at a compatible
+[Biohub ESM environment](https://github.com/Biohub/esm), and both weight
+variables at local checkpoint directories.
 
-If the variables are unset, locate the directories and put them in the
-predictor's `env:` block in `backends.yaml`. Without local assets these tools
-try to download from Hugging Face.
+```yaml
+predictors:
+  esmfold2_overlay:
+    enabled: true
+    repo: /path/to/acceleration-kit
+    python: /path/to/esmfold2-env/bin/python
+    mode: blackwell                  # also accepts tiled or stock
+    env:
+      ESMFOLD2_WEIGHTS: /path/to/ESMFold2
+      ESMFOLD2_ESMC: /path/to/ESMC-6B
+```
+
+For a campaign with one single-chain protein per FASTA file under
+`sequences/`, include `esmfold2_overlay` in `score.predictors`.
+
+```bash
+pdflow doctor --predictor esmfold2_overlay
+pdflow predict --campaign runs/monomer --predictors esmfold2_overlay
+pdflow score --campaign runs/monomer
+pdflow finalize --campaign runs/monomer
+```
+
+Each prediction call loads the model once. A supplied A3M must have the same
+query sequence; a query-only A3M is handled as a single-sequence input. Each
+batch writes its CIFs under `structures/`, raw PAE and pLDDT under
+`confidences/`, and `summary.json`, `ranking.csv`, and `index.json` at
+`predictions/_batches/esmfold2_overlay/batch-*/output/`. Finalization keeps this
+batch output. Per-design failures appear in the prediction status and scores.
+
+The legacy `esmfold2` configuration continues to run ESMFold v1.
 
 ### ESMFold
 

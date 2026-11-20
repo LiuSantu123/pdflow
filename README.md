@@ -78,7 +78,7 @@ in place. The generated config contains:
 | OpenDDE | `opendde pred` | stock env + kit fast; query-only MSA fallback |
 | Mol-1 | `mol pred` | same JSON dialect; set `MOL_ROOT_DIR` |
 | ESMFold v1 | `run_esmfold.py` | single-chain only, no MSA; needs `--fp32` on this OpenFold build |
-| ESMFold2 overlay | `scripts/esmfold2_50.sh` | reserved; `blackwell`/`tiled`/`stock`; disabled until ESMFold2 + ESMC-6B weights are configured |
+| ESMFold2 | `esmfold2_overlay` via `scripts/esmfold2_50.sh` | batches single-chain protein inputs with the local ESMFold2 and ESMC-6B checkpoints |
 | tmol | `tmol` env | score / minimize / relax |
 | US-align | standalone binary | used for global and per-chain RMSD/TM-score |
 
@@ -203,11 +203,12 @@ Setup notes:
 - First run of a mode pays JIT compilation; `MODEL_OPT_JIT_ROOT` keeps caches
   warm.
 
-**ESMFold2:** the current `esmfold2` backend is ESMFold v1 and has no kit. The
-new GitHub overlay is ESMFold2 + ESMC-6B with modes `blackwell` (default),
-`tiled` (low-memory reference) and `stock`; it is not a `fast`/`big` pair. It
-needs `esm==3.4.0`, `ESMFOLD2_WEIGHTS`, `ESMFOLD2_ESMC`, and those weights are
-not present on this host yet.
+**ESMFold2:** add `esmfold2_overlay` to the campaign's `score.predictors` and
+enable that backend in `backends.yaml`. It uses a separate ESM environment and
+loads the model once for all eligible inputs to `pdflow predict`. The existing
+`esmfold2` key still selects ESMFold v1 for compatibility with older campaigns.
+See [ESMFold2 setup](docs/AGENT_SETUP.md#esmfold2-overlay) for the launcher's
+configuration and commands.
 
 ## Metrics
 

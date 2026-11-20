@@ -28,6 +28,7 @@ class ModelArtifact:
     pae_files: list[Path] = field(default_factory=list)
     plddt_files: list[Path] = field(default_factory=list)
     rank: int = 0
+    summary: dict[str, Any] = field(default_factory=dict)
 
     @property
     def stem(self) -> str:
@@ -41,19 +42,27 @@ def _numeric_suffix(path: Path) -> int:
     return int(matches[-1]) if matches else 0
 
 
-def discover_models(predictor: str, outdir: Path) -> list[ModelArtifact]:
+def discover_models(
+    predictor: str, outdir: Path, *, design: str | None = None,
+    batch_summary: dict[str, dict[str, Any]] | None = None,
+) -> list[ModelArtifact]:
     if predictor == "esmfold2_overlay":
-        structures = sorted(Path(outdir).rglob("structures/*.cif"))
+        if design is not None:
+            structure = outdir / "structures" / f"{design}_model.cif"
+            structures = [structure] if structure.is_file() else []
+        else:
+            structures = sorted(outdir.glob("structures/*.cif"))
         if not structures:
-            structures = sorted(Path(outdir).rglob("*.cif"))
+            return []
         artifacts: list[ModelArtifact] = []
         for index, structure in enumerate(structures):
-            conf_dir = structure.parent.parent / "confidences"
-            npzs = (
-                sorted(conf_dir.glob(f"{structure.stem}*.npz"))
-                if conf_dir.is_dir()
-                else []
-            )
+            name = structure.stem.removesuffix("_model")
+            confidence = outdir / "confidences" / f"{name}_confidences.npz"
+            npzs = [confidence] if confidence.is_file() else []
+            if not npzs:
+                continue
+            row = (batch_summary or {}).get(name, {})
+            summary = {key: row[key] for key in ("ptm", "iptm") if key in row}
             artifacts.append(
                 ModelArtifact(
                     predictor=predictor,
@@ -61,6 +70,7 @@ def discover_models(predictor: str, outdir: Path) -> list[ModelArtifact]:
                     pae_files=npzs,
                     plddt_files=npzs,
                     rank=index,
+                    summary=summary,
                 )
             )
         return artifacts
@@ -552,6 +562,8 @@ def score_model(
         }
     array = structures.load_structure_file(artifact.structure)
     docs = _load_json_docs(artifact.confidence_jsons)
+    if artifact.summary:
+        docs.append(artifact.summary)
     pae = _find_matrix(docs, "pae")
     if pae is None:
         pae = _load_npz_value(artifact.pae_files, "pae")

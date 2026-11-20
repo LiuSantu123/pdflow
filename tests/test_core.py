@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import numpy as np
 import pytest
@@ -8,6 +10,7 @@ import yaml
 from biotite.structure import AtomArray
 
 from pdflow import metrics, predict, setup, structures
+from pdflow.cli import main
 from pdflow.naming import format_header, parse_header, read_fasta, write_fasta
 from pdflow.predict import build_job, write_af3_json, write_af3like_json, write_boltz_yaml
 
@@ -187,8 +190,83 @@ def test_setup_materializes_native_profile(tmp_path: Path) -> None:
     assert data["predictors"]["esmfold2_overlay"]["enabled"] is False
 
 
-def test_esmfold2_overlay_is_reserved_but_safe(tmp_path: Path) -> None:
+def test_esmfold2_overlay_is_disabled_by_default(tmp_path: Path) -> None:
     job = predict.Job("demo", [predict.Chain("A", sequence="ACDE")])
     result = predict.run_esmfold2_overlay(job, tmp_path, {})
     assert result["returncode"] == 0
     assert "disabled" in result["skipped"]
+
+
+def test_esmfold2_overlay_batches_scores_and_retains_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "kit"
+    script = repo / "scripts" / "esmfold2_50.sh"
+    script.parent.mkdir(parents=True)
+    script.touch()
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    config = tmp_path / "backends.yaml"
+    config.write_text(yaml.safe_dump({"predictors": {"esmfold2_overlay": {
+        "enabled": True,
+        "repo": str(repo),
+        "env": {"ESMFOLD2_WEIGHTS": str(weights), "ESMFOLD2_ESMC": str(weights)},
+    }}}))
+    root = tmp_path / "campaign"
+    args = ["--config", str(config)]
+    campaign_args = ["--campaign", str(root)]
+    assert main([*args, "new", *campaign_args]) == 0
+    (root / "campaign.yaml").write_text("score:\n  predictors: [esmfold2_overlay]\n  tmol: false\n")
+    for name in ("toy", "toy_next", "toy_failure"):
+        write_fasta(root / "sequences" / f"{name}.fasta", [(f">{name} chain=B", "ST")])
+
+    reference = tmp_path / "reference.pdb"
+    _write_two_chain_pdb(reference)
+    array = structures.load_structure_file(reference)
+    array = array[array.chain_id == "B"]
+    invocations: list[Path] = []
+
+    def fake_launcher(command, *, env, log_path):
+        assert Path(command[1]) == script
+        assert env["ESMFOLD2_WEIGHTS"] == str(weights)
+        inputs, output = map(Path, command[2:4])
+        invocations.append(output)
+        assert {p.stem for p in inputs.glob("*.json")} == {"toy", "toy_next", "toy_failure"}
+        for path in inputs.glob("*.json"):
+            assert json.loads(path.read_text()) == {"proteins": [{"sequence": "ST", "chains": ["B"]}]}
+
+        (output / "structures").mkdir(parents=True)
+        (output / "confidences").mkdir()
+        rows = [{"design": "toy_failure", "status": "oom", "error": "test failure"}]
+        for name, ptm in (("toy", 0.7), ("toy_next", 0.8)):
+            structures.save_structure_file(output / "structures" / f"{name}_model.cif", array)
+            np.savez(
+                output / "confidences" / f"{name}_confidences.npz",
+                pae=np.full((2, 2), 2.0), plddt=np.full(2, ptm),
+            )
+            rows.append({"design": name, "status": "ok", "ptm": ptm})
+        (output / "summary.json").write_text(json.dumps({"results": rows}))
+        (output / "ranking.csv").write_text("design,ptm\ntoy_next,0.8\ntoy,0.7\n")
+        (output / "index.json").write_text("{}")
+        return CompletedProcess(command, 1)
+
+    monkeypatch.setattr(predict, "run_command", fake_launcher)
+    assert main([*args, "predict", *campaign_args]) == 1
+    assert len(invocations) == 1
+    assert main([*args, "score", *campaign_args]) == 0
+    for name, ptm in (("toy", 0.7), ("toy_next", 0.8)):
+        scores = root / "predictions" / name / "esmfold2_overlay" / "scores.json"
+        models = json.loads(scores.read_text())["models"]
+        assert len(models) == 1
+        assert models[0]["ptm"] == pytest.approx(ptm)
+        assert models[0]["mean_plddt"] == pytest.approx(ptm * 100)
+        assert models[0]["mean_pae"] == pytest.approx(2.0)
+    failed = root / "predictions" / "toy_failure" / "esmfold2_overlay" / "scores.json"
+    assert json.loads(failed.read_text())["error"] == "test failure"
+
+    assert main([*args, "finalize", *campaign_args]) == 0
+    output = invocations[0]
+    assert (output / "confidences" / "toy_confidences.npz").is_file()
+    assert (output / "structures" / "toy_next_model.cif").is_file()
+    for name in ("summary.json", "ranking.csv", "index.json"):
+        assert (output / name).is_file()

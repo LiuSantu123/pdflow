@@ -131,6 +131,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if not ok:
             problems.append(f"{label}: {candidate}")
 
+    overlay = get(cfg, "predictors.esmfold2_overlay", {}) or {}
+    overlay_only = getattr(args, "predictor", None) == "esmfold2_overlay"
+    if overlay.get("enabled"):
+        repo = Path(str(overlay.get("repo", ""))).expanduser()
+        check("esmfold2_overlay.script", str(repo / "scripts" / "esmfold2_50.sh"))
+        env = predict.esmfold2_overlay_env(overlay)
+        python = env.get("ESMFOLD2_PYTHON", "python")
+        check("esmfold2_overlay.python", python, kind="exec")
+        for key in ("ESMFOLD2_WEIGHTS", "ESMFOLD2_ESMC"):
+            check(f"esmfold2_overlay.{key}", env.get(key), kind="dir")
+    elif overlay_only:
+        print("[FAIL] esmfold2_overlay is disabled")
+        return 1
+    else:
+        print("[SKIP] esmfold2_overlay disabled")
+    if overlay_only:
+        if not problems:
+            result = run_command(
+                [python, "-c", "from esm.models.esmfold2 import EsmFold2Model, ESMFold2InputBuilder"],
+                env=env,
+            )
+            if result.returncode != 0:
+                print(result.stderr.rstrip())
+                print("[FAIL] esmfold2_overlay Python imports")
+                return 1
+            print("[OK] esmfold2_overlay Python imports")
+        return int(bool(problems))
+
     usalign = get(cfg, "usalign.binary")
     check("usalign", usalign, kind="exec")
     if usalign and Path(usalign).is_file():
@@ -167,19 +195,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 check(f"{name}.{key}", predictor[key], kind="dir")
         if predictor.get("weights"):
             check(f"{name}.weights", predictor["weights"])
-
-    overlay = get(cfg, "predictors.esmfold2_overlay", {}) or {}
-    if overlay.get("enabled"):
-        repo = Path(str(overlay.get("repo", ""))).expanduser()
-        check("esmfold2_overlay.script", repo / "scripts" / "esmfold2_50.sh")
-        if overlay.get("python"):
-            check("esmfold2_overlay.python", str(overlay["python"]), kind="exec")
-        for key in ("ESMFOLD2_WEIGHTS", "ESMFOLD2_ESMC"):
-            value = (overlay.get("env", {}) or {}).get(key)
-            if value:
-                check(f"esmfold2_overlay.{key}", str(value), kind="dir")
-    else:
-        print("[SKIP] esmfold2_overlay disabled (reserved interface)")
 
     tmol_python = get(cfg, "tmol.python")
     check("tmol.python", tmol_python, kind="exec")
@@ -317,6 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
     new.set_defaults(func=cmd_new)
 
     doctor = sub.add_parser("doctor", help="check all configured backends")
+    doctor.add_argument("--predictor", choices=["esmfold2_overlay"],
+                        help="check only this optional backend")
     doctor.set_defaults(func=cmd_doctor)
 
     ingest = sub.add_parser("ingest", help="import final backbones (RFD3/BoltzGen/RFD4)")
